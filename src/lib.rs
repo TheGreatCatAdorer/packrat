@@ -1,15 +1,16 @@
 use std::{collections::HashMap, hash::Hash, iter::repeat};
 
-pub struct Parser(Vec<u16>, Vec<fn(char) -> bool>);
+pub struct Parser(Vec<u32>, Vec<fn(char) -> bool>);
 #[derive(Clone)]
-pub struct ParseTree(Vec<u8>);
-pub struct MemoTable(HashMap<(u16, usize), Option<(ParseTree, usize)>>);
+pub struct ParseTree(Vec<u32>);
+pub struct MemoTable(HashMap<(u32, usize), Option<(ParseTree, usize)>>);
 
 pub enum Grammar<T> {
     End,
     Ref(T),
     Seq(Vec<Grammar<T>>),
-    Alt(Vec<Grammar<T>>),
+    Any(Vec<Grammar<T>>),
+    All(Vec<Grammar<T>>),
     Char(fn(char) -> bool),
     Next,
     Memo(Box<Grammar<T>>),
@@ -33,10 +34,10 @@ pub fn make_parser<'a>(grammar: Vec<(&'a str, Grammar<&'a str>)>) -> Result<Pars
 
 pub fn lower_grammar<'a>(
     grammar: Vec<(&'a str, Grammar<&'a str>)>,
-) -> Result<Vec<Grammar<u16>>, &'a str> {
+) -> Result<Vec<Grammar<u32>>, &'a str> {
     let mut map = HashMap::new();
     for (i, (label, _)) in grammar.iter().enumerate() {
-        map.insert(*label, i as u16);
+        map.insert(*label, i as u32);
     }
     let mut result = Vec::with_capacity(grammar.len());
     for (label, g) in grammar {
@@ -68,7 +69,12 @@ fn replace_refs<T: Eq + Hash, U: Clone>(
                 .map(|t| replace_refs(t, map))
                 .collect::<Option<Vec<_>>>()?,
         )),
-        Grammar::Alt(ts) => Some(Grammar::Alt(
+        Grammar::Any(ts) => Some(Grammar::Any(
+            ts.into_iter()
+                .map(|t| replace_refs(t, map))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Grammar::All(ts) => Some(Grammar::All(
             ts.into_iter()
                 .map(|t| replace_refs(t, map))
                 .collect::<Option<Vec<_>>>()?,
@@ -76,11 +82,30 @@ fn replace_refs<T: Eq + Hash, U: Clone>(
     }
 }
 
-fn encode_grammar(
-    grammar: Grammar<u16>,
-    code: &mut Vec<u16>,
+fn grammar_cases(
+    class: u32,
+    cases: Vec<Grammar<u32>>,
+    code: &mut Vec<u32>,
     tokens: &mut Vec<fn(char) -> bool>,
-    to_memo: &mut Vec<(u16, u16)>,
+    to_memo: &mut Vec<(u32, u32)>,
+) -> Result<(), ()> {
+    code.push(class);
+    code.push(cases.len().try_into().map_err(|_| ())?);
+    let start = code.len();
+    code.extend(repeat(0).take(cases.len()));
+    for (i, g) in cases.into_iter().enumerate() {
+        code[start + i] = code.len().try_into().map_err(|_| ())?;
+        encode_grammar(g, code, tokens, to_memo)?;
+    }
+    code.push(Parser::TERM);
+    Ok(())
+}
+
+fn encode_grammar(
+    grammar: Grammar<u32>,
+    code: &mut Vec<u32>,
+    tokens: &mut Vec<fn(char) -> bool>,
+    to_memo: &mut Vec<(u32, u32)>,
 ) -> Result<(), ()> {
     match grammar {
         Grammar::End => code.push(Parser::END),
@@ -88,28 +113,9 @@ fn encode_grammar(
             to_memo.push((code.len().try_into().map_err(|_| ())?, g_i));
             code.push(0);
         }
-        Grammar::Seq(grammars) => {
-            code.push(Parser::SEQ);
-            code.push(grammars.len().try_into().map_err(|_| ())?);
-            let start = code.len();
-            code.extend(repeat(0).take(grammars.len()));
-            for (i, g) in grammars.into_iter().enumerate() {
-                code[start + i] = code.len().try_into().map_err(|_| ())?;
-                encode_grammar(g, code, tokens, to_memo)?;
-            }
-            code.push(Parser::TERM);
-        }
-        Grammar::Alt(grammars) => {
-            code.push(Parser::ALT);
-            code.push(grammars.len().try_into().unwrap());
-            let start = code.len();
-            code.extend(repeat(0).take(grammars.len()));
-            for (i, g) in grammars.into_iter().enumerate() {
-                code[start + i] = code.len().try_into().map_err(|_| ())?;
-                encode_grammar(g, code, tokens, to_memo)?;
-            }
-            code.push(Parser::TERM);
-        }
+        Grammar::Seq(cases) => grammar_cases(Parser::SEQ, cases, code, tokens, to_memo)?,
+        Grammar::Any(cases) => grammar_cases(Parser::ANY, cases, code, tokens, to_memo)?,
+        Grammar::All(cases) => grammar_cases(Parser::ALL, cases, code, tokens, to_memo)?,
         Grammar::Char(f) => {
             code.push(Parser::CHAR);
             code.push(tokens.len().try_into().map_err(|_| ())?);
@@ -125,12 +131,9 @@ fn encode_grammar(
         }
         Grammar::Word(w) => {
             code.push(Parser::WORD);
-            code.push(w.len() as u16);
-            let mut bytes = w.bytes();
-            while let Some(b) = bytes.next() {
-                let c = bytes.next().unwrap_or(0);
-                let p = [b, c];
-                code.push(unsafe { std::mem::transmute(p) });
+            code.push(w.chars().count() as u32);
+            for c in w.chars() {
+                code.push(c as u32);
             }
         }
         Grammar::Space => {
@@ -138,27 +141,27 @@ fn encode_grammar(
         }
         Grammar::Many0(g) => {
             code.push(Parser::MANY0);
-            code.push(code.len() as u16 + 1);
+            code.push(code.len() as u32 + 1);
             encode_grammar(*g, code, tokens, to_memo)?;
         }
         Grammar::Many1(g) => {
             code.push(Parser::MANY1);
-            code.push(code.len() as u16 + 1);
+            code.push(code.len() as u32 + 1);
             encode_grammar(*g, code, tokens, to_memo)?;
         }
     }
     Ok(())
 }
 
-impl TryFrom<Vec<Grammar<u16>>> for Parser {
+impl TryFrom<Vec<Grammar<u32>>> for Parser {
     type Error = ();
-    fn try_from(value: Vec<Grammar<u16>>) -> Result<Self, ()> {
+    fn try_from(value: Vec<Grammar<u32>>) -> Result<Self, ()> {
         let mut code = Vec::new();
         let mut tokens = Vec::new();
         let mut start_indices = Vec::with_capacity(value.len());
         let mut to_memo = Vec::new();
         for g in value {
-            start_indices.push(code.len() as u16);
+            start_indices.push(code.len() as u32);
             encode_grammar(g, &mut code, &mut tokens, &mut to_memo)?;
         }
         for (p, g) in to_memo {
@@ -169,23 +172,24 @@ impl TryFrom<Vec<Grammar<u16>>> for Parser {
 }
 
 impl Parser {
-    const END: u16 = 0;
-    const SEQ: u16 = 1;
-    const ALT: u16 = 2;
-    const CHAR: u16 = 3;
-    const NEXT: u16 = 4;
-    const MEMO: u16 = 5;
-    const WORD: u16 = 6;
-    const SPACE: u16 = 7;
-    const MANY0: u16 = 8;
-    const MANY1: u16 = 9;
-    const TERM: u16 = u16::MAX;
-    pub fn run(&self, start: u16, string: &str) -> Option<(ParseTree, usize)> {
+    const END: u32 = 0;
+    const SEQ: u32 = 1;
+    const ANY: u32 = 2;
+    const ALL: u32 = 3;
+    const CHAR: u32 = 4;
+    const NEXT: u32 = 5;
+    const MEMO: u32 = 6;
+    const WORD: u32 = 7;
+    const SPACE: u32 = 8;
+    const MANY0: u32 = 9;
+    const MANY1: u32 = 10;
+    const TERM: u32 = u32::MAX;
+    pub fn run(&self, start: u32, string: &str) -> Option<(ParseTree, usize)> {
         self.run_from(start, string, 0, &mut MemoTable(HashMap::new()))
     }
     fn run_from(
         &self,
-        state: u16,
+        state: u32,
         string: &str,
         mut pos: usize,
         table: &mut MemoTable,
@@ -210,9 +214,9 @@ impl Parser {
             }
             res[1] = count;
             Some((ParseTree(res), pos))
-        } else if form == Self::ALT {
+        } else if form == Self::ANY || form == Self::ALL {
             let mut state = state + 1;
-            let mut res = vec![ParseTree::ALT, 0];
+            let mut res = vec![ParseTree::ANY, 0];
             let mut count = 0;
             loop {
                 let i = self.0[state as usize];
@@ -239,7 +243,7 @@ impl Parser {
             let diff = next.len_utf8();
             let mut res = Vec::with_capacity(1 + diff);
             res.push(ParseTree::CHAR);
-            next.encode_utf8(res.as_mut_slice());
+            res.push(next as u32);
             Some((ParseTree(res), pos + diff))
         } else if form == Self::NEXT {
             Some((ParseTree(Vec::new()), pos))
@@ -257,20 +261,13 @@ impl Parser {
             }
         } else if form == Self::WORD {
             let len = self.0[state as usize + 1] as usize;
-            let word: &str = unsafe {
-                let slice: &[u8] = &self.0[..].align_to().1;
-                let start = state as usize + 2;
-                std::mem::transmute(&slice[start..start + len])
-            };
-            for (c, w) in string[pos..].chars().zip(word.chars()) {
-                if c != w {
+            let word = &self.0[state as usize + 2..state as usize + 2 + len];
+            for (c, w) in string[pos..].chars().zip(word.iter().cloned()) {
+                if c as u32 != w {
                     return None;
                 }
             }
-            Some((
-                ParseTree(vec![ParseTree::WORD]),
-                pos + word.as_bytes().len(),
-            ))
+            Some((ParseTree(vec![ParseTree::WORD]), pos + word.len()))
         } else if form == Self::SPACE {
             let mut i = pos;
             while string.as_bytes()[i] == b' ' {
@@ -304,12 +301,13 @@ impl Parser {
 }
 
 impl ParseTree {
-    const END: u8 = 0;
-    const SEQ: u8 = 1;
-    const ALT: u8 = 2;
-    const CHAR: u8 = 3;
-    const WORD: u8 = 4;
-    const SPACE: u8 = 5;
-    const MANY: u8 = 6;
-    const TERM: u8 = u8::MAX;
+    const END: u32 = 0;
+    const SEQ: u32 = 1;
+    const ANY: u32 = 2;
+    //const ALL: u32 = 3;
+    const CHAR: u32 = 4;
+    const WORD: u32 = 5;
+    const SPACE: u32 = 6;
+    const MANY: u32 = 7;
+    const TERM: u32 = u32::MAX;
 }
